@@ -1,3 +1,8 @@
+// Entry point for the Git-forge bounty entry (github-core-clone-01): a standalone
+// GitHub-compatible forge in a single Node process. The lifecycle below is the kit's
+// starter wire-up, kept as issued; the forge itself lives in app.ts and src/ —
+// git smart HTTP, REST v3, GraphQL v4 and MCP, all served from an in-memory store.
+//
 // The entry <-> env lifecycle, as env/src/wire.ts settles it: bind an ephemeral port, tell the env the
 // port it bound, then poll until the env says the trial is over and exit 0. Keep this file as it is:
 // the suite scores the server app.ts builds, and the lifecycle is the harness's, not the contest's.
