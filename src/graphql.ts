@@ -392,7 +392,7 @@ FIELDS.User = {
 };
 
 FIELDS.Repository = {
-  id: (repo: Repo) => store.gid('Repository', repo),
+  id: (repo: Repo) => repo.nodeId,
   databaseId: (repo: Repo) => repo.id,
   name: (repo: Repo) => repo.name,
   nameWithOwner: (repo: Repo) => `${store.viewerLogin ?? 'viewer'}/${repo.name}`,
@@ -417,7 +417,7 @@ FIELDS.Repository = {
 };
 
 FIELDS.Issue = {
-  id: (v) => store.gid('Issue', v.repo, v.issue.number),
+  id: (v) => v.issue.nodeId,
   number: (v) => v.issue.number,
   title: (v) => v.issue.title,
   body: (v) => v.issue.body,
@@ -430,7 +430,7 @@ FIELDS.Issue = {
 };
 
 FIELDS.PullRequest = {
-  id: (v) => store.gid('PullRequest', v.repo, v.pull.number),
+  id: (v) => v.pull.nodeId,
   number: (v) => v.pull.number,
   title: (v) => v.pull.title,
   body: (v) => v.pull.body,

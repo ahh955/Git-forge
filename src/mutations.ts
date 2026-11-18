@@ -26,7 +26,7 @@ export function findRepoById(id: number): Repo | undefined {
 
 export function createIssueInRepo(repo: Repo, title: string, body: string, labels: string[] = []): Issue {
   const number = store.nextIssueNumber(repo);
-  const issue: Issue = { id: store.nextItemId(), number, title, body, state: 'open', labels, createdSeq: store.nextSeq(), updatedSeq: store.nextSeq() };
+  const issue: Issue = { id: store.nextItemId(), number, title, body, state: 'open', labels, createdSeq: store.nextSeq(), updatedSeq: store.nextSeq(), nodeId: store.gid('Issue', repo, number) };
   repo.issues.set(number, issue);
   return issue;
 }
@@ -36,6 +36,7 @@ export function closeIssueInRepo(repo: Repo, number: number): Issue | null {
   if (!issue) return null;
   issue.state = 'closed';
   issue.updatedSeq = store.nextSeq();
+  repo.issueBodyCache.delete(number);
   return issue;
 }
 
@@ -47,7 +48,7 @@ export function createPullInRepo(repo: Repo, title: string, body: string, head: 
     return { error: 'A pull request already exists' };
   }
   const number = store.nextIssueNumber(repo);
-  const pull: Pull = { id: store.nextItemId(), number, title, body, state: 'open', head: { ref: head, sha: headSha }, base: { ref: base, sha: baseSha }, merged: false, merged_at: null, merge_commit_sha: null, createdSeq: store.nextSeq() };
+  const pull: Pull = { id: store.nextItemId(), number, title, body, state: 'open', head: { ref: head, sha: headSha }, base: { ref: base, sha: baseSha }, merged: false, merged_at: null, merge_commit_sha: null, createdSeq: store.nextSeq(), nodeId: store.gid('PullRequest', repo, number) };
   repo.pulls.set(number, pull);
   return pull;
 }
@@ -75,6 +76,7 @@ export function addCommentToIssue(repo: Repo, number: number, body: string): Com
   const list = repo.comments.get(number) ?? [];
   list.push(comment);
   repo.comments.set(number, list);
+  repo.issueBodyCache.delete(number);
   return comment;
 }
 

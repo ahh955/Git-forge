@@ -6,7 +6,7 @@ const asBuffer = (u: Uint8Array): Buffer => Buffer.isBuffer(u) ? u : Buffer.from
 export const ZERO_OID = '0'.repeat(40);
 export interface TreeEntry { mode: string; name: string; oid: string }
 export interface Commit { tree: string; parents: string[]; author: string; committer: string; message: string }
-export const hashObject = (type: ObjectType, data: Uint8Array): string => createHash('sha1').update(Buffer.from(`${type} ${data.byteLength}\0`)).update(data).digest('hex');
+export const hashObject = (type: ObjectType, data: Uint8Array): string => createHash('sha1').update(`${type} ${data.byteLength}\0`, 'utf8').update(data).digest('hex');
 
 export function parseTree(data: Uint8Array): TreeEntry[] {
   const b = asBuffer(data), out: TreeEntry[] = [];

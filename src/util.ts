@@ -11,9 +11,34 @@ export const unb64url = (value: string): string => Buffer.from(value, 'base64url
 export const sha1 = (value: Uint8Array): string => createHash('sha1').update(value).digest('hex');
 
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(Buffer.byteLength(text)), ...headers });
-  res.end(text);
+  // One UTF-8 pass: Buffer.from encodes once and gives the exact byte length,
+  // replacing Buffer.byteLength (a full scan) + res.end(string) (a second encode
+  // on the write path).
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`);
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(buf.length), ...headers });
+  res.end(buf);
+}
+
+/** sendJson for a response body that is already serialized (cached GETs). */
+export function sendJsonBuffer(res: ServerResponse, status: number, buf: Buffer, headers: Record<string, string> = {}): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(buf.length), ...headers });
+  res.end(buf);
+}
+
+/** Lazily-parsed query string: most requests never read a parameter, so the
+ *  URLSearchParams object is built only on first access. */
+export class Query {
+  private p: URLSearchParams | null = null;
+  private raw: string;
+  constructor(raw: string) { this.raw = raw; }
+  get(name: string): string | null {
+    if (!this.p) this.p = new URLSearchParams(this.raw);
+    return this.p.get(name);
+  }
+  has(name: string): boolean {
+    if (!this.p) this.p = new URLSearchParams(this.raw);
+    return this.p.has(name);
+  }
 }
 
 export function sendEmpty(res: ServerResponse, status: number, headers: Record<string, string> = {}): void {

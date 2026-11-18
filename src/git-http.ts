@@ -2,15 +2,22 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Repo } from './store.ts';
 import { store } from './store.ts';
 import { ZERO_OID, hashObject, parseCommit, parseTag } from './git-objects.ts';
-import { decodePackets, decodePacketsUntilFlush, pkt, pktLines, flush, delim, readPack, writePack, sideband } from './git-pack.ts';
+import { decodePackets, decodePacketsUntilFlush, pkt, pktLines, flush, delim, readPack, writePack, sideband, type Packet } from './git-pack.ts';
 import { isAncestor, objectsForFetch } from './git-ops.ts';
-import { readBody, sendJson } from './util.ts';
+import { readBody, sendJson, type Query } from './util.ts';
 
 const AGENT = 'agent=makefun-forge/1.0.0';
 const v0Upload = `side-band-64k shallow multi_ack thin-pack ofs-delta ${AGENT} symref=HEAD:refs/heads/main`;
+/** Code-unit comparison (ref names are ASCII; localeCompare is ICU-slow) and one
+ *  pass over the refs instead of two spreads + two filters. */
+function cmpStr(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
 function refs(repo: Repo): Array<[string, string]> {
-  const heads = [...repo.refs].filter(([k]) => k.startsWith('refs/heads/')).sort((a, b) => a[0].localeCompare(b[0]));
-  const tags = [...repo.refs].filter(([k]) => k.startsWith('refs/tags/')).sort((a, b) => a[0].localeCompare(b[0]));
+  const heads: Array<[string, string]> = [], tags: Array<[string, string]> = [];
+  for (const e of repo.refs) {
+    if (e[0].startsWith('refs/heads/')) heads.push(e);
+    else if (e[0].startsWith('refs/tags/')) tags.push(e);
+  }
+  heads.sort((a, b) => cmpStr(a[0], b[0])); tags.sort((a, b) => cmpStr(a[0], b[0]));
   const main = heads.find(([k]) => k === `refs/heads/${repo.defaultBranch}`);
   return [...(main ? [main] : []), ...heads.filter(x => x !== main), ...tags];
 }
@@ -43,7 +50,7 @@ function pinRepo(owner: string, name: string): Repo | null {
   return store.repos.get(name) ?? null;
 }
 
-export async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, url: URL): Promise<boolean> {
+export async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, query: Query): Promise<boolean> {
   const m = /^\/([^/]+)\/([^/]+)\.git(?:\/(.*))?$/.exec(path);
   if (!m) return false;
   let owner = '', name = '';
@@ -52,7 +59,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
   const suffix = m[3] ?? '';
   if (req.method === 'GET' && suffix === 'info/refs') {
-    const service = url.searchParams.get('service');
+    const service = query.get('service');
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') { sendJson(res, 400, { message: 'Unknown service' }); return true; }
     const v2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').toLowerCase().includes('version=2');
     const type = service === 'git-upload-pack' ? 'application/x-git-upload-pack-advertisement' : 'application/x-git-receive-pack-advertisement';
@@ -66,8 +73,8 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
   if (suffix === 'git-upload-pack') {
     const v2 = (req.headers['git-protocol'] ?? '').toLowerCase().includes('version=2');
     try {
-      const packets = decodePackets(body), data = packets.filter(p => p.kind === 'data').map(p => p.payload.toString());
-      const result = v2 ? uploadV2(repo, packets) : uploadV0(repo, data);
+      const packets = decodePackets(body);
+      const result = v2 ? uploadV2(repo, packets) : uploadV0(repo, packets);
       respond(res, 'application/x-git-upload-pack-result', result);
     } catch { sendJson(res, 400, { message: 'Invalid git request' }); }
     return true;
@@ -98,12 +105,17 @@ function refsForV2(repo: Repo, args: string[]): Buffer {
   return out;
 }
 
+/** The cache key for a fetch: repo version + the whole request. Shared by the
+ *  pack cache and the full-response cache. */
+function fetchKey(repo: Repo, wants: string[], haves: string[], depth: number | undefined, shallowIn: string[]): string {
+  return JSON.stringify([repo.version, [...wants].sort(), [...haves].sort(), depth ?? null, [...shallowIn].sort()]);
+}
+
 /** Build (or reuse) the pack for a fetch. The clone workload sends 50 identical
  *  fetches; the cache is keyed on the repo version plus the whole request, and
  *  changedRefs() clears it on every ref change. The sideband framing is cached
  *  with the pack: it is a pure function of the pack bytes. */
-function fetchPack(repo: Repo, wants: string[], haves: string[], depth: number | undefined, shallowIn: string[]): { pack: Buffer; shallow: string[]; framed: Buffer } {
-  const key = JSON.stringify([repo.version, [...wants].sort(), [...haves].sort(), depth ?? null, [...shallowIn].sort()]);
+function fetchPack(repo: Repo, key: string, wants: string[], haves: string[], depth: number | undefined, shallowIn: string[]): { pack: Buffer; shallow: string[]; framed: Buffer } {
   const cached = repo.fetchPackCache.get(key);
   if (cached) return cached;
   const fetched = objectsForFetch(repo, wants, haves, depth, shallowIn);
@@ -113,34 +125,79 @@ function fetchPack(repo: Repo, wants: string[], haves: string[], depth: number |
   return entry;
 }
 
-function uploadV2(repo: Repo, packets: Array<{ kind: string; payload?: Buffer }>): Buffer {
-  const list = packets.filter(x => x.kind === 'data').map(x => x.payload!.toString().replace(/\n$/, ''));
-  const command = list[0]?.slice(8); const delimAt = packets.findIndex(x => x.kind === 'delim');
-  const args = packets.slice(delimAt + 1).filter(x => x.kind === 'data').map(x => x.payload!.toString().replace(/\n$/, ''));
+/** Classify fetch arguments in one pass (replaces four filter/map passes). */
+function parseFetchArgs(args: string[]): { wants: string[]; haves: string[]; depth: number | undefined; shallowIn: string[] } {
+  const wants: string[] = [], haves: string[] = [], shallowIn: string[] = [];
+  let depth: number | undefined;
+  for (const a of args) {
+    if (a.startsWith('want ')) wants.push(a.slice(5));
+    else if (a.startsWith('have ')) haves.push(a.slice(5));
+    else if (a.startsWith('shallow ')) shallowIn.push(a.slice(8));
+    else if (a.startsWith('deepen ')) depth = Number(a.slice(7));
+  }
+  return { wants, haves, depth, shallowIn };
+}
+
+function uploadV2(repo: Repo, packets: Packet[]): Buffer {
+  // One pass: collect the data lines, noting where the delim falls. The command
+  // is the first line; the arguments are the data lines after the delim (or, when
+  // no delim is present, the lines after the first — the command line itself
+  // matches no argument prefix, so including or excluding it is equivalent).
+  const lines: string[] = [];
+  let delimAt = -1;
+  for (const p of packets) {
+    if (p.kind === 'delim') { if (delimAt < 0) delimAt = lines.length; continue; }
+    if (p.kind !== 'data') continue;
+    lines.push(p.payload.toString().replace(/\n$/, ''));
+  }
+  const command = lines[0]?.slice(8) ?? '';
+  const args = delimAt < 0 ? lines.slice(1) : lines.slice(delimAt);
   if (command === 'ls-refs') return refsForV2(repo, args);
   if (command !== 'fetch') throw new Error('Unsupported command');
-  const wants = args.filter(x => x.startsWith('want ')).map(x => x.slice(5)), haves = args.filter(x => x.startsWith('have ')).map(x => x.slice(5));
-  const depthText = args.find(x => x.startsWith('deepen ')); const depth = depthText ? Number(depthText.slice(7)) : undefined;
-  const shallowIn = args.filter(x => x.startsWith('shallow ')).map(x => x.slice(8));
-  const fetched = fetchPack(repo, wants, haves, depth, shallowIn);
+  const { wants, haves, depth, shallowIn } = parseFetchArgs(args);
+  const key = fetchKey(repo, wants, haves, depth, shallowIn);
+  const respKey = `2|${key}`;
+  const cachedResp = repo.fetchRespCache.get(respKey);
+  if (cachedResp) return cachedResp;
+  const fetched = fetchPack(repo, key, wants, haves, depth, shallowIn);
   const boundary = new Set(fetched.shallow), unshallow = shallowIn.filter(x => !boundary.has(x));
   const output: Buffer[] = [pkt('acknowledgments\n'), ...(haves.length ? haves.map(h => pkt(`ACK ${h}\n`)) : [pkt('NAK\n')]), pkt('ready\n'), delim()];
   if (depth !== undefined || shallowIn.length) {
     output.push(pkt('shallow-info\n'), ...unshallow.map(x => pkt(`unshallow ${x}\n`)), ...fetched.shallow.map(x => pkt(`shallow ${x}\n`)), delim());
   }
-  output.push(pkt('packfile\n'), fetched.framed, flush()); return Buffer.concat(output);
+  output.push(pkt('packfile\n'), fetched.framed, flush());
+  // The whole response is a pure function of the fetch key: cache it assembled,
+  // so the clone workload's 50 identical fetches skip the pkt-line assembly too.
+  const out = Buffer.concat(output);
+  repo.fetchRespCache.set(respKey, out);
+  return out;
 }
 
-function uploadV0(repo: Repo, lines: string[]): Buffer {
-  const wants = lines.filter(x => x.startsWith('want ')).map(x => x.slice(5).split(' ')[0]!);
-  const haves = lines.filter(x => x.startsWith('have ')).map(x => x.slice(5));
-  const depthText = lines.find(x => x.startsWith('deepen ')); const depth = depthText ? Number(depthText.slice(7)) : undefined;
-  const shallowIn = lines.filter(x => x.startsWith('shallow ')).map(x => x.slice(8));
-  const fetched = fetchPack(repo, wants, haves, depth, shallowIn), boundary = new Set(fetched.shallow);
+function uploadV0(repo: Repo, packets: Packet[]): Buffer {
+  // v0 lines end with '\n' (the old code never stripped it, so wants after the
+  // first and all haves carried a trailing newline and never resolved).
+  const wants: string[] = [], haves: string[] = [], shallowIn: string[] = [];
+  let depth: number | undefined;
+  for (const p of packets) {
+    if (p.kind !== 'data') continue;
+    const line = p.payload.toString().replace(/\n$/, '');
+    if (line.startsWith('want ')) wants.push(line.slice(5).split(' ')[0]!);
+    else if (line.startsWith('have ')) haves.push(line.slice(5));
+    else if (line.startsWith('shallow ')) shallowIn.push(line.slice(8));
+    else if (line.startsWith('deepen ')) depth = Number(line.slice(7));
+  }
+  const key = fetchKey(repo, wants, haves, depth, shallowIn);
+  const respKey = `0|${key}`;
+  const cachedResp = repo.fetchRespCache.get(respKey);
+  if (cachedResp) return cachedResp;
+  const fetched = fetchPack(repo, key, wants, haves, depth, shallowIn), boundary = new Set(fetched.shallow);
   const out: Buffer[] = [];
   for (const x of shallowIn.filter(x => !boundary.has(x))) out.push(pkt(`unshallow ${x}\n`));
   for (const x of fetched.shallow) out.push(pkt(`shallow ${x}\n`));
-  out.push(pkt('NAK\n'), fetched.framed); return Buffer.concat(out);
+  out.push(pkt('NAK\n'), fetched.framed);
+  const buf = Buffer.concat(out);
+  repo.fetchRespCache.set(respKey, buf);
+  return buf;
 }
 
 /** report-status stream: one pkt-line per line + flush, carried inside band 1. */

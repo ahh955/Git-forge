@@ -8,7 +8,8 @@ export const asBuffer = (u: Uint8Array): Buffer => Buffer.isBuffer(u) ? u : Buff
 
 export type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' | 'delim' | 'end' };
 export function pkt(data: string | Uint8Array): Buffer {
-  const b = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data), h = Buffer.from((b.length + 4).toString(16).padStart(4, '0'));
+  // asBuffer: a Buffer input is used as-is (Buffer.from would copy it).
+  const b = typeof data === 'string' ? Buffer.from(data) : asBuffer(data), h = Buffer.from((b.length + 4).toString(16).padStart(4, '0'));
   if (b.length > 65516) throw new Error('pkt-line too large');
   return Buffer.concat([h, b]);
 }
@@ -17,13 +18,24 @@ export const delim = (): Buffer => Buffer.from('0001');
 export function pktLines(lines: Array<string | Uint8Array | 'flush' | 'delim'>): Buffer {
   return Buffer.concat(lines.map(x => x === 'flush' ? flush() : x === 'delim' ? delim() : pkt(x)));
 }
+/** One hex digit's value, or -1. Faster than toString + a regex per pkt-line. */
+function hexVal(c: number): number {
+  if (c >= 48 && c <= 57) return c - 48;
+  if (c >= 97 && c <= 102) return c - 87;
+  if (c >= 65 && c <= 70) return c - 55;
+  return -1;
+}
+/** The 4-hex pkt-line length at offset p, or -1 when the header is invalid. */
+function pktLen(b: Buffer, p: number): number {
+  const a = hexVal(b[p]!), c1 = hexVal(b[p + 1]!), c2 = hexVal(b[p + 2]!), c3 = hexVal(b[p + 3]!);
+  if (a < 0 || c1 < 0 || c2 < 0 || c3 < 0) return -1;
+  return (a << 12) | (c1 << 8) | (c2 << 4) | c3;
+}
 export function decodePackets(data: Uint8Array): Packet[] {
   const b = asBuffer(data), out: Packet[] = []; let p = 0;
   while (p < b.length) {
     if (p + 4 > b.length) throw new Error('Truncated pkt-line');
-    const raw = b.toString('ascii', p, p + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(raw)) throw new Error('Invalid pkt-line header');
-    const n = parseInt(raw, 16); p += 4;
+    const n = pktLen(b, p); if (n < 0) throw new Error('Invalid pkt-line header'); p += 4;
     if (n === 0) out.push({ kind: 'flush' }); else if (n === 1) out.push({ kind: 'delim' }); else if (n === 2) out.push({ kind: 'end' });
     else { if (n < 4 || p + n - 4 > b.length) throw new Error('Invalid pkt-line length'); out.push({ kind: 'data', payload: b.subarray(p, p + n - 4) }); p += n - 4; }
   }
@@ -37,9 +49,7 @@ export function decodePacketsUntilFlush(data: Uint8Array): { packets: Packet[]; 
   const b = asBuffer(data), out: Packet[] = []; let p = 0;
   while (p < b.length) {
     if (p + 4 > b.length) throw new Error('Truncated pkt-line');
-    const raw = b.toString('ascii', p, p + 4);
-    if (!/^[0-9a-fA-F]{4}$/.test(raw)) throw new Error('Invalid pkt-line header');
-    const n = parseInt(raw, 16); p += 4;
+    const n = pktLen(b, p); if (n < 0) throw new Error('Invalid pkt-line header'); p += 4;
     if (n === 0) { out.push({ kind: 'flush' }); return { packets: out, consumed: p }; }
     if (n === 1) out.push({ kind: 'delim' }); else if (n === 2) out.push({ kind: 'end' });
     else { if (n < 4 || p + n - 4 > b.length) throw new Error('Invalid pkt-line length'); out.push({ kind: 'data', payload: b.subarray(p, p + n - 4) }); p += n - 4; }
@@ -67,7 +77,8 @@ function readVar(b: Buffer, state: { p: number }): number {
 }
 export function readPack(input: Uint8Array): Map<string, GitObject> {
   const b = asBuffer(input), trailer = b.length - 20;
-  if (b.length < 32 || b.toString('ascii', 0, 4) !== 'PACK' || ![2, 3].includes(b.readUInt32BE(4))) throw new Error('Invalid pack header');
+  const packVersion = b.length >= 8 ? b.readUInt32BE(4) : 0;
+  if (b.length < 32 || b.toString('ascii', 0, 4) !== 'PACK' || (packVersion !== 2 && packVersion !== 3)) throw new Error('Invalid pack header');
   if (!createHash('sha1').update(b.subarray(0, trailer)).digest().equals(b.subarray(trailer))) throw new Error('Pack checksum mismatch');
   const count = b.readUInt32BE(8), byOid = new Map<string, GitObject>(); let p = 12;
   const pending: Array<{ type: number; data: Buffer; baseOffset?: number; baseOid?: string; offset: number }> = [];
@@ -118,7 +129,11 @@ export function readPack(input: Uint8Array): Map<string, GitObject> {
 
 export function sideband(pack: Uint8Array): Buffer {
   const b = asBuffer(pack), parts: Buffer[] = [];
-  for (let p = 0; p < b.length; p += 65515) parts.push(pkt(Buffer.concat([Buffer.from([1]), b.subarray(p, p + 65515)])));
+  for (let p = 0; p < b.length; p += 65515) {
+    const len = Math.min(65515, b.length - p);
+    const chunk = Buffer.allocUnsafe(len + 1); chunk[0] = 1; b.copy(chunk, 1, p, p + len);
+    parts.push(pkt(chunk));
+  }
   if (!parts.length) parts.push(pkt(Buffer.from([1])));
   return Buffer.concat(parts);
 }
