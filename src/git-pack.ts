@@ -3,6 +3,9 @@ import { deflateSync, inflateSync } from 'node:zlib';
 import type { GitObject, ObjectType } from './store.ts';
 import { hashObject } from './git-objects.ts';
 
+/** A Uint8Array as a Buffer without copying when it already is one. */
+export const asBuffer = (u: Uint8Array): Buffer => Buffer.isBuffer(u) ? u : Buffer.from(u);
+
 export type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' | 'delim' | 'end' };
 export function pkt(data: string | Uint8Array): Buffer {
   const b = typeof data === 'string' ? Buffer.from(data) : Buffer.from(data), h = Buffer.from((b.length + 4).toString(16).padStart(4, '0'));
@@ -15,7 +18,7 @@ export function pktLines(lines: Array<string | Uint8Array | 'flush' | 'delim'>):
   return Buffer.concat(lines.map(x => x === 'flush' ? flush() : x === 'delim' ? delim() : pkt(x)));
 }
 export function decodePackets(data: Uint8Array): Packet[] {
-  const b = Buffer.from(data), out: Packet[] = []; let p = 0;
+  const b = asBuffer(data), out: Packet[] = []; let p = 0;
   while (p < b.length) {
     if (p + 4 > b.length) throw new Error('Truncated pkt-line');
     const raw = b.toString('ascii', p, p + 4);
@@ -31,7 +34,7 @@ export function decodePackets(data: Uint8Array): Packet[] {
  *  A receive-pack body is a command list followed by RAW pack bytes, so the full
  *  body must never be decoded as pkt-lines — the pack would throw. */
 export function decodePacketsUntilFlush(data: Uint8Array): { packets: Packet[]; consumed: number } {
-  const b = Buffer.from(data), out: Packet[] = []; let p = 0;
+  const b = asBuffer(data), out: Packet[] = []; let p = 0;
   while (p < b.length) {
     if (p + 4 > b.length) throw new Error('Truncated pkt-line');
     const raw = b.toString('ascii', p, p + 4);
@@ -63,26 +66,35 @@ function readVar(b: Buffer, state: { p: number }): number {
   return x;
 }
 export function readPack(input: Uint8Array): Map<string, GitObject> {
-  const b = Buffer.from(input), trailer = b.length - 20;
+  const b = asBuffer(input), trailer = b.length - 20;
   if (b.length < 32 || b.toString('ascii', 0, 4) !== 'PACK' || ![2, 3].includes(b.readUInt32BE(4))) throw new Error('Invalid pack header');
   if (!createHash('sha1').update(b.subarray(0, trailer)).digest().equals(b.subarray(trailer))) throw new Error('Pack checksum mismatch');
-  const count = b.readUInt32BE(8), objects: GitObject[] = [], byOid = new Map<string, GitObject>(); let p = 12;
+  const count = b.readUInt32BE(8), byOid = new Map<string, GitObject>(); let p = 12;
   const pending: Array<{ type: number; data: Buffer; baseOffset?: number; baseOid?: string; offset: number }> = [];
+  const offsets = new Map<number, GitObject | { type: number; data: Buffer; baseOffset?: number; baseOid?: string; offset: number }>();
   for (let i = 0; i < count; i++) {
     const offset = p; let c = b[p++], type = c >> 4 & 7, size = c & 15, shift = 4;
     while (c & 128) { c = b[p++]; size += (c & 127) * 2 ** shift; shift += 7; }
-    const e: { type: number; data: Buffer; baseOffset?: number; baseOid?: string; offset: number } = { type, data: Buffer.alloc(0), offset };
-    if (type === 6) { c = b[p++]; let distance = c & 127; while (c & 128) { c = b[p++]; distance = (distance + 1) * 128 + (c & 127); } e.baseOffset = offset - distance; }
-    if (type === 7) { e.baseOid = b.subarray(p, p + 20).toString('hex'); p += 20; }
+    let baseOffset: number | undefined, baseOid: string | undefined;
+    if (type === 6) { c = b[p++]; let distance = c & 127; while (c & 128) { c = b[p++]; distance = (distance + 1) * 128 + (c & 127); } baseOffset = offset - distance; }
+    if (type === 7) { baseOid = b.subarray(p, p + 20).toString('hex'); p += 20; }
     const inflated = inflateSync(b.subarray(p, trailer), { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
-    e.data = inflated.buffer; p += inflated.engine.bytesWritten; if (e.data.length !== size) throw new Error('Pack object size mismatch'); pending.push(e);
+    p += inflated.engine.bytesWritten;
+    if (inflated.buffer.length !== size) throw new Error('Pack object size mismatch');
+    if (type >= 1 && type <= 4) {
+      // Fast path: plain objects resolve immediately (no pending/resolve machinery).
+      const obj: GitObject = { type: (['', 'commit', 'tree', 'blob', 'tag'][type]) as ObjectType, data: inflated.buffer };
+      byOid.set(hashObject(obj.type, obj.data), obj);
+      offsets.set(offset, obj);
+    } else {
+      const e = { type, data: inflated.buffer, baseOffset, baseOid, offset };
+      pending.push(e); offsets.set(offset, e);
+    }
   }
-  const offsets = new Map(pending.map(e => [e.offset, e]));
   const resolve = (e: typeof pending[number], seen = new Set<number>()): GitObject => {
     if (seen.has(e.offset)) throw new Error('Delta cycle'); seen.add(e.offset);
-    if (e.type >= 1 && e.type <= 4) return { type: (['', 'commit', 'tree', 'blob', 'tag'][e.type]) as ObjectType, data: e.data };
     let base: GitObject | undefined;
-    if (e.type === 6) { const be = offsets.get(e.baseOffset!); if (be) base = resolve(be, seen); }
+    if (e.type === 6) { const be = offsets.get(e.baseOffset!); if (be) base = typeof be.type === 'string' ? be : resolve(be, seen); }
     else base = byOid.get(e.baseOid!);
     if (!base) throw new Error('Missing delta base');
     const state = { p: 0 }, baseLen = readVar(e.data, state), targetLen = readVar(e.data, state);
@@ -99,13 +111,13 @@ export function readPack(input: Uint8Array): Map<string, GitObject> {
     }
     if (w !== targetLen) throw new Error('Delta target size mismatch'); return { type: base.type, data: out };
   };
-  for (const e of pending) { const obj = resolve(e); const oid = hashObject(obj.type, obj.data); byOid.set(oid, obj); objects.push(obj); }
+  for (const e of pending) { const obj = resolve(e); const oid = hashObject(obj.type, obj.data); byOid.set(oid, obj); }
   if (p !== trailer) throw new Error('Trailing pack bytes');
-  return new Map(objects.map(obj => [hashObject(obj.type, obj.data), obj]));
+  return byOid;
 }
 
 export function sideband(pack: Uint8Array): Buffer {
-  const b = Buffer.from(pack), parts: Buffer[] = [];
+  const b = asBuffer(pack), parts: Buffer[] = [];
   for (let p = 0; p < b.length; p += 65515) parts.push(pkt(Buffer.concat([Buffer.from([1]), b.subarray(p, p + 65515)])));
   if (!parts.length) parts.push(pkt(Buffer.from([1])));
   return Buffer.concat(parts);

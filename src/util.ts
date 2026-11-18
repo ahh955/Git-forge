@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 
-export const fixedNow = (): string => process.env.MAKEFUN_TRIAL_NOW || '2025-01-01T00:00:00.000Z';
+/** The fixed trial instant: the environment never changes at runtime, so read it once. */
+const NOW = process.env.MAKEFUN_TRIAL_NOW || '2025-01-01T00:00:00.000Z';
+export const fixedNow = (): string => NOW;
 let requestCounter = 0;
 export const nextRequestId = (): string => `req-${++requestCounter}`;
 export const b64url = (value: string): string => Buffer.from(value).toString('base64url');
@@ -21,7 +23,7 @@ export function sendEmpty(res: ServerResponse, status: number, headers: Record<s
 
 export async function readBody(req: AsyncIterable<Uint8Array>): Promise<Buffer> {
   const chunks: Buffer[] = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
 

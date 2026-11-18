@@ -9,16 +9,16 @@ const expectedToken = process.env.MAKEFUN_SHOP_TOKEN ?? '';
 
 export function createApp(): Server {
   return createServer(async (req: IncomingMessage, res) => {
-    const path = (() => { try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; } })();
+    const url = (() => { try { return new URL(req.url ?? '/', 'http://entry'); } catch { return new URL('/', 'http://entry'); } })();
+    const path = url.pathname;
     if (req.method === 'GET' && path === '/healthz') { sendJson(res, 200, { ok: true }); return; }
     const reqId = nextRequestId();
     const auth = req.headers.authorization ?? '';
-    const match = /^Bearer (.+)$/.exec(auth);
-    if (!match || (expectedToken ? match[1] !== expectedToken : !match[1])) {
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (!token || (expectedToken && token !== expectedToken)) {
       sendJson(res, 401, { message: 'Bad credentials' }, { 'x-github-request-id': reqId }); return;
     }
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
       if (await handleRest(req, res, path, url)) return;
       if (await handleGraphQL(req, res, path)) return;
       if (await handleMcp(req, res, path)) return;

@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto';
 import type { GitObject, ObjectType } from './store.ts';
 
+const asBuffer = (u: Uint8Array): Buffer => Buffer.isBuffer(u) ? u : Buffer.from(u);
+
 export const ZERO_OID = '0'.repeat(40);
 export interface TreeEntry { mode: string; name: string; oid: string }
 export interface Commit { tree: string; parents: string[]; author: string; committer: string; message: string }
 export const hashObject = (type: ObjectType, data: Uint8Array): string => createHash('sha1').update(Buffer.from(`${type} ${data.byteLength}\0`)).update(data).digest('hex');
 
 export function parseTree(data: Uint8Array): TreeEntry[] {
-  const b = Buffer.from(data), out: TreeEntry[] = [];
+  const b = asBuffer(data), out: TreeEntry[] = [];
   for (let p = 0; p < b.length;) {
     const sp = b.indexOf(32, p), nul = b.indexOf(0, sp + 1);
     if (sp < 0 || nul < 0 || nul + 21 > b.length) throw new Error('Malformed tree');
@@ -39,7 +41,7 @@ export function buildTree(entries: TreeEntry[]): Buffer {
 }
 
 export function parseCommit(data: Uint8Array): Commit {
-  const text = Buffer.from(data).toString(), split = text.indexOf('\n\n');
+  const text = asBuffer(data).toString(), split = text.indexOf('\n\n');
   const headers = split < 0 ? text : text.slice(0, split), message = split < 0 ? '' : text.slice(split + 2);
   const lines = headers.split('\n'), tree = lines.find(x => x.startsWith('tree '))?.slice(5) ?? '';
   if (!/^[0-9a-f]{40}$/.test(tree)) throw new Error('Malformed commit tree');
@@ -47,7 +49,7 @@ export function parseCommit(data: Uint8Array): Commit {
 }
 
 export function parseTag(data: Uint8Array): { object: string; type: ObjectType } {
-  const lines = Buffer.from(data).toString().split('\n');
+  const lines = asBuffer(data).toString().split('\n');
   const object = lines.find(x => x.startsWith('object '))?.slice(7) ?? '';
   const type = lines.find(x => x.startsWith('type '))?.slice(5) as ObjectType;
   if (!/^[0-9a-f]{40}$/.test(object)) throw new Error('Malformed tag');
@@ -60,7 +62,7 @@ export function buildCommit(fields: { tree: string; parents?: string[]; message:
 }
 
 export function addObject(repo: { objects: Map<string, GitObject> }, type: ObjectType, data: Uint8Array): string {
-  const bytes = Buffer.from(data), oid = hashObject(type, bytes);
+  const bytes = asBuffer(data), oid = hashObject(type, bytes);
   repo.objects.set(oid, { type, data: bytes });
   return oid;
 }

@@ -17,7 +17,7 @@ function commitRef(repo: Repo, ref?: string | null): string | null {
   if (!ref) return repo.refs.get(`refs/heads/${repo.defaultBranch}`) ?? null;
   return repo.refs.get(ref.startsWith('refs/') ? ref : `refs/heads/${ref}`) ?? (repo.objects.get(ref)?.type === 'commit' ? ref : null);
 }
-function pathSegments(raw: string): string { try { return decodeURIComponent(raw).replace(/^\/+|\/+$/g, ''); } catch { return raw; } }
+function pathSegments(raw: string): string { if (!raw.includes('%')) return raw.replace(/^\/+|\/+$/g, ''); try { return decodeURIComponent(raw).replace(/^\/+|\/+$/g, ''); } catch { return raw; } }
 function commitContent(repo: Repo, branch: string, path: string, bytes: Buffer, message: string): { blob: string; commit: string; created: boolean } {
   let tip = repo.refs.get(`refs/heads/${branch}`); if (!tip && branch !== repo.defaultBranch) tip = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
   const oldTree = tip ? treeOid(repo, tip) : null, files = oldTree ? flattenTree(repo, oldTree) : new Map<string, { oid: string; mode: string }>();
@@ -37,7 +37,7 @@ function commitDelete(repo: Repo, branch: string, path: string, message: string)
 
 export async function handleRest(req: IncomingMessage, res: ServerResponse, path: string, url: URL): Promise<boolean> {
   if (!path.startsWith('/api/v3')) return false;
-  const parts = path.slice('/api/v3'.length).split('/').filter(Boolean).map(x => { try { return decodeURIComponent(x); } catch { return x; } });
+  const parts = path.slice('/api/v3'.length).split('/').filter(Boolean).map(x => { if (!x.includes('%')) return x; try { return decodeURIComponent(x); } catch { return x; } });
   const method = req.method ?? 'GET';
   if (!parts.length && method === 'GET') { reply(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' }); return true; }
   if (parts[0] === 'meta' && method === 'GET') { reply(res, 200, { installed_version: '1.0.0' }); return true; }

@@ -47,7 +47,7 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
   const m = /^\/([^/]+)\/([^/]+)\.git(?:\/(.*))?$/.exec(path);
   if (!m) return false;
   let owner = '', name = '';
-  try { owner = decodeURIComponent(m[1]!); name = decodeURIComponent(m[2]!); } catch { sendJson(res, 400, { message: 'Bad path' }); return true; }
+  try { const a = m[1]!, b = m[2]!; owner = a.includes('%') ? decodeURIComponent(a) : a; name = b.includes('%') ? decodeURIComponent(b) : b; } catch { sendJson(res, 400, { message: 'Bad path' }); return true; }
   const repo = pinRepo(owner, name);
   if (!repo) { sendJson(res, 404, { message: 'Not Found' }); return true; }
   const suffix = m[3] ?? '';
@@ -56,7 +56,10 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
     if (service !== 'git-upload-pack' && service !== 'git-receive-pack') { sendJson(res, 400, { message: 'Unknown service' }); return true; }
     const v2 = service === 'git-upload-pack' && (req.headers['git-protocol'] ?? '').toLowerCase().includes('version=2');
     const type = service === 'git-upload-pack' ? 'application/x-git-upload-pack-advertisement' : 'application/x-git-receive-pack-advertisement';
-    respond(res, type, advertisement(repo, service, v2)); return true;
+    const advertKey = `${service}|${v2 ? '2' : '0'}`;
+    let advert = repo.advertCache.get(advertKey);
+    if (!advert) { advert = advertisement(repo, service, v2); repo.advertCache.set(advertKey, advert); }
+    respond(res, type, advert); return true;
   }
   if (req.method !== 'POST') { sendJson(res, 404, { message: 'Not Found' }); return true; }
   const body = await readBody(req);
@@ -79,6 +82,9 @@ export async function handleGit(req: IncomingMessage, res: ServerResponse, path:
 
 function refsForV2(repo: Repo, args: string[]): Buffer {
   const prefixes = args.filter(x => x.startsWith('ref-prefix ')).map(x => x.slice(11));
+  const key = `${args.includes('peel') ? 'p' : ''}|${JSON.stringify([...prefixes].sort())}`;
+  const cached = repo.lsRefsCache.get(key);
+  if (cached) return cached;
   const match = (n: string) => !prefixes.length || prefixes.some(p => n.startsWith(p));
   const lines: string[] = [];
   if (match('HEAD')) { const main = repo.refs.get(`refs/heads/${repo.defaultBranch}`); lines.push(`${main ?? ZERO_OID} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`); }
@@ -87,18 +93,22 @@ function refsForV2(repo: Repo, args: string[]): Buffer {
     if (args.includes('peel')) { const peeled = peel(repo, oid); if (peeled && peeled !== oid) attrs += ` peeled:${peeled}`; }
     lines.push(`${oid} ${name}${attrs}\n`);
   }
-  return pktLines([...lines, 'flush']);
+  const out = pktLines([...lines, 'flush']);
+  repo.lsRefsCache.set(key, out);
+  return out;
 }
 
 /** Build (or reuse) the pack for a fetch. The clone workload sends 50 identical
  *  fetches; the cache is keyed on the repo version plus the whole request, and
- *  changedRefs() clears it on every ref change. */
-function fetchPack(repo: Repo, wants: string[], haves: string[], depth: number | undefined, shallowIn: string[]): { pack: Buffer; shallow: string[] } {
+ *  changedRefs() clears it on every ref change. The sideband framing is cached
+ *  with the pack: it is a pure function of the pack bytes. */
+function fetchPack(repo: Repo, wants: string[], haves: string[], depth: number | undefined, shallowIn: string[]): { pack: Buffer; shallow: string[]; framed: Buffer } {
   const key = JSON.stringify([repo.version, [...wants].sort(), [...haves].sort(), depth ?? null, [...shallowIn].sort()]);
   const cached = repo.fetchPackCache.get(key);
   if (cached) return cached;
   const fetched = objectsForFetch(repo, wants, haves, depth, shallowIn);
-  const entry = { pack: writePack(fetched.objects), shallow: fetched.shallow };
+  const pack = writePack(fetched.objects);
+  const entry = { pack, shallow: fetched.shallow, framed: sideband(pack) };
   repo.fetchPackCache.set(key, entry);
   return entry;
 }
@@ -114,12 +124,11 @@ function uploadV2(repo: Repo, packets: Array<{ kind: string; payload?: Buffer }>
   const shallowIn = args.filter(x => x.startsWith('shallow ')).map(x => x.slice(8));
   const fetched = fetchPack(repo, wants, haves, depth, shallowIn);
   const boundary = new Set(fetched.shallow), unshallow = shallowIn.filter(x => !boundary.has(x));
-  const pack = fetched.pack;
   const output: Buffer[] = [pkt('acknowledgments\n'), ...(haves.length ? haves.map(h => pkt(`ACK ${h}\n`)) : [pkt('NAK\n')]), pkt('ready\n'), delim()];
   if (depth !== undefined || shallowIn.length) {
     output.push(pkt('shallow-info\n'), ...unshallow.map(x => pkt(`unshallow ${x}\n`)), ...fetched.shallow.map(x => pkt(`shallow ${x}\n`)), delim());
   }
-  output.push(pkt('packfile\n'), sideband(pack), flush()); return Buffer.concat(output);
+  output.push(pkt('packfile\n'), fetched.framed, flush()); return Buffer.concat(output);
 }
 
 function uploadV0(repo: Repo, lines: string[]): Buffer {
@@ -128,10 +137,10 @@ function uploadV0(repo: Repo, lines: string[]): Buffer {
   const depthText = lines.find(x => x.startsWith('deepen ')); const depth = depthText ? Number(depthText.slice(7)) : undefined;
   const shallowIn = lines.filter(x => x.startsWith('shallow ')).map(x => x.slice(8));
   const fetched = fetchPack(repo, wants, haves, depth, shallowIn), boundary = new Set(fetched.shallow);
-  const pack = fetched.pack, out: Buffer[] = [];
+  const out: Buffer[] = [];
   for (const x of shallowIn.filter(x => !boundary.has(x))) out.push(pkt(`unshallow ${x}\n`));
   for (const x of fetched.shallow) out.push(pkt(`shallow ${x}\n`));
-  out.push(pkt('NAK\n'), sideband(pack)); return Buffer.concat(out);
+  out.push(pkt('NAK\n'), fetched.framed); return Buffer.concat(out);
 }
 
 /** report-status stream: one pkt-line per line + flush, carried inside band 1. */
